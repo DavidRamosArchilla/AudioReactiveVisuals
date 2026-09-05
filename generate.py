@@ -36,10 +36,36 @@ def resolve_model_rev():
     return snaps
 
 
-def analyze_audio(path, fps, max_duration=None):
+def estimate_tempo_raw(y, sr):
+    """librosa estimate + octave disambiguation (it often halves 200 BPM->99)."""
+    import librosa
+    est, _ = librosa.beat.beat_track(y=y, sr=sr)
+    est = float(np.atleast_1d(est)[0])
+    onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=512)
+    onset = onset - onset.mean()
+    ac = np.correlate(onset, onset, mode="full")[len(onset) - 1 :]
+    ac = ac / (ac[0] or 1.0)
+    fps_e = sr / 512
+    best, best_v = est, -1.0
+    for bpm in range(90, 261):
+        lag = int(round(fps_e * 60.0 / bpm))
+        if lag < len(ac):
+            v = float(ac[lag])
+            # Prefer the faster octave when it has real support.
+            if v > best_v + (0.05 if bpm > 1.6 * est else 0.0):
+                best, best_v = bpm, v
+    return best
+
+
+def analyze_audio(path, fps, max_duration=None, tempo=None):
     y, sr = librosa.load(path, sr=22050, mono=True, duration=max_duration)
     dur = len(y) / sr
     n_frames = max(1, int(dur * fps))
+    if tempo is None:
+        tempo = estimate_tempo_raw(y, sr)
+        tempo_source = "estimated"
+    else:
+        tempo_source = "manual"
     # Onset envelope at frame resolution.
     hop = 512
     onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
@@ -59,6 +85,36 @@ def analyze_audio(path, fps, max_duration=None):
     if len(peaks) == 0:
         peaks = np.where(energy > 0.65)[0]
         peaks = peaks[np.concatenate([[True], np.diff(peaks) > int(fps * 0.25)])]
+    # Beat-grid kick detection: with a known tempo, score every beat slot so
+    # fast kick runs (e.g. 200 BPM = kick every 0.3s) are all caught.
+    beat = 60.0 / float(tempo)
+    anchor = float(peaks[0] / fps) if len(peaks) else 0.0
+    grid_hits = []
+    k = 0
+    while True:
+        g = anchor + k * beat
+        if g >= dur:
+            break
+        if g >= 0:
+            lo = max(0, int((g - 0.07) * fps))
+            hi = min(n_frames, int((g + 0.07) * fps) + 1)
+            if hi > lo:
+                m = lo + int(np.argmax(energy[lo:hi]))
+                if float(energy[m]) >= 0.30:
+                    grid_hits.append(m)
+        k += 1
+    if grid_hits:
+        merged = sorted(set(peaks.tolist()) | set(grid_hits))
+        # Dedupe within 0.1s, keep the stronger frame.
+        dedup, last = [], -10**9
+        for p in merged:
+            if p - last > int(fps * 0.1):
+                dedup.append(p)
+                last = p
+            elif float(energy[p]) > float(energy[last]):
+                dedup[-1] = p
+                last = p
+        peaks = np.array(sorted(dedup), dtype=int)
     strengths = energy[peaks] if len(peaks) else np.array([], dtype=np.float32)
     # Hit decay envelope for pulse effects.
     hit_env = np.zeros(n_frames, dtype=np.float32)
@@ -68,7 +124,7 @@ def analyze_audio(path, fps, max_duration=None):
     for p, s in zip(peaks.tolist(), strengths.tolist()):
         w = min(n_frames - p, len(decay))
         hit_env[p : p + w] = np.maximum(hit_env[p : p + w], decay[:w] * float(s))
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    tempo = float(tempo)
     return {
         "y": y,
         "sr": sr,
@@ -78,7 +134,8 @@ def analyze_audio(path, fps, max_duration=None):
         "hit_env": hit_env,
         "is_hit": is_hit,
         "hits": sorted((float(p / fps), float(s)) for p, s in zip(peaks.tolist(), strengths.tolist())),
-        "tempo": float(np.atleast_1d(tempo)[0]),
+        "tempo": float(tempo),
+        "tempo_source": tempo_source,
     }
 
 
@@ -153,36 +210,59 @@ def diffusion_keyframes_chained(prompts, seed, steps=8, gen_w=640, gen_h=368,
     return keys, (revs[0] if revs else "unknown")
 
 
+def grade_keys(keys):
+    """Tame neon-yellow skies toward sage: desaturate H 18-36, nudge hue +10."""
+    out = []
+    for k in keys:
+        hsv = cv2.cvtColor(k, cv2.COLOR_RGB2HSV).astype(np.float32)
+        H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+        m = (H >= 18) & (H <= 36) & (S > 40)
+        S[m] *= 0.45
+        H[m] = np.clip(H[m] + 10, 0, 179)
+        hsv = np.stack([H, S, V], axis=-1).astype(np.uint8)
+        out.append(cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB))
+    return out
+
+
 def upscale_keys(keys, w, h):
     """Lanczos upscale + light unsharp mask for crisper render frames."""
     out = []
     for k in keys:
         up = cv2.resize(k, (w, h), interpolation=cv2.INTER_LANCZOS4)
         blur = cv2.GaussianBlur(up, (0, 0), 2.0)
-        sharp = cv2.addWeighted(up, 1.35, blur, -0.35, 0)
+        sharp = cv2.addWeighted(up, 1.20, blur, -0.20, 0)
         out.append(sharp)
     return out
 
 
-def plan_segments(n_frames, is_hit, hit_env, n_keys, fps, key_every=2.5):
-    """Slow, coherent scene evolution: advance on a fixed cadence; hits only
-    drive camera pulse/brightness (not scene switches), except extreme hits."""
+def plan_segments(n_frames, is_hit, hit_env, n_keys, fps, key_every="auto",
+                  tempo=100.0, beats_per_scene=2, t0=0.0):
+    """Scene schedule. key_every='auto' = beat grid (beats_per_scene beats per
+    scene, anchored at t0); numeric = fixed seconds (legacy). Hits only force a
+    switch when extreme; the kick punch is rendered by the spring zoom."""
     seg = np.zeros(n_frames, dtype=int)
+    if key_every == "auto":
+        scene_len = beats_per_scene * 60.0 / tempo
+    else:
+        scene_len = float(key_every)
     cur, last_switch = 0, 0
-    auto_every = int(fps * key_every)
     for f in range(n_frames):
-        extreme = bool(is_hit[f]) and float(hit_env[f]) > 0.90
-        if extreme and f - last_switch > int(fps * 1.0):
-            cur = (cur + 1) % n_keys
-            last_switch = f
-        elif f - last_switch >= auto_every:
-            cur = (cur + 1) % n_keys
-            last_switch = f
+        t = f / fps
+        scene_idx = int((t - t0) // scene_len) if t >= t0 else 0
+        scheduled = scene_idx % n_keys
+        if scheduled != cur and f - last_switch >= int(fps * 0.3):
+            cur, last_switch = scheduled, f
+        else:
+            extreme = bool(is_hit[f]) and float(hit_env[f]) > 0.90
+            if extreme and f - last_switch > int(fps * 1.0):
+                cur = (cur + 1) % n_keys
+                last_switch = f
         seg[f] = cur
     return seg
 
 
-def render_frames(keys, analysis, seg, w, h, fps, seed):
+def render_frames(keys, analysis, seg, w, h, fps, seed, tempo=100.0,
+                  beats_per_scene=2, zoom_punch=0.02, zoom_tau=0.22):
     rng = random.Random(seed)
     shakes = [(rng.uniform(-1, 1), rng.uniform(-1, 1)) for _ in range(len(keys) * 8 + 8)]
     energy, hit_env = analysis["energy"], analysis["hit_env"]
@@ -193,6 +273,10 @@ def render_frames(keys, analysis, seg, w, h, fps, seed):
     bw, bh = big[0]
     frames = []
     blend = max(2, int(fps * 0.6))  # long dreamy morph between coherent keys
+    scene_len = beats_per_scene * 60.0 / tempo
+    damp = float(np.exp(-1.0 / (fps * zoom_tau)))  # spring release
+    pull = float(np.exp(-1.0 / (fps * 0.2)))  # return to baseline
+    z, zv = 0.0, 0.0  # spring zoom offset + velocity
     for f in range(n):
         cur = int(seg[f])
         # Find segment start for blend factor.
@@ -205,7 +289,16 @@ def render_frames(keys, analysis, seg, w, h, fps, seed):
             t = 1.0
         prev = int(seg[s - 1]) if s > 0 else cur
         e, he = float(energy[f]), float(hit_env[f])
-        zoom = 1.0 + 0.13 * e + 0.18 * he
+        # Kick-punch spring: sudden zoom attack on hits, smooth release.
+        if bool(analysis["is_hit"][f]):
+            zv += he * zoom_punch
+        z += zv
+        zv *= damp
+        z *= pull
+        z = float(np.clip(z, 0.0, 0.30))
+        # Continuous push-in across the scene + subtle energy breathing.
+        r = min(1.0, (f / fps) % scene_len / scene_len) if scene_len > 0 else 0.0
+        zoom = 1.0 + 0.06 * r + 0.05 * e + z
         # Crop window with slow pan + hit shake.
         cw, ch = int(w / zoom), int(h / zoom)
         px = (bw - cw) * (0.5 + 0.4 * np.sin(f / (fps * 3.0)))
@@ -217,8 +310,9 @@ def render_frames(keys, analysis, seg, w, h, fps, seed):
         b = KB[cur][int(py) : int(py) + ch, int(px) : int(px) + cw]
         frame = cv2.addWeighted(a, 1 - t, b, t, 0)
         frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
-        # Brightness pulse on hits.
-        frame = np.clip(frame.astype(np.float32) * (1.0 + 0.22 * he), 0, 255).astype(np.uint8)
+        # Brightness pulse on hits (capped to avoid blowing highlights).
+        gain = 1.0 + min(0.12 * he, 0.08)
+        frame = np.clip(frame.astype(np.float32) * gain, 0, 255).astype(np.uint8)
         frames.append(frame)
     return frames
 
@@ -256,8 +350,18 @@ def main():
     ap.add_argument("--no-diffusion", action="store_true", help="procedural keyframes, no GPU")
     ap.add_argument("--chain-strength", type=float, default=0.55, help="img2img strength between chained keys (lower=more stable)")
     ap.add_argument("--negative-prompt", type=str, default="blurry, low detail, watermark, text")
-    ap.add_argument("--key-every", type=float, default=2.5, help="seconds per keyframe scene")
-    ap.add_argument("--test", action="store_true", help="shortcut: 4s, 640x360")
+    ap.add_argument("--no-grade", action="store_true", help="skip sage-grade of yellow skies")
+    ap.add_argument("--key-every", type=str, default="auto",
+                    help="'auto' = beat grid (beats-per-scene), or fixed seconds")
+    ap.add_argument("--beats-per-scene", type=int, default=2,
+                    help="scene length in beats when key-every=auto")
+    ap.add_argument("--tempo", type=float, default=None,
+                    help="BPM override; if omitted, estimated from audio")
+    ap.add_argument("--zoom-punch", type=float, default=0.05,
+                    help="spring kick added to zoom velocity per hit (x strength)")
+    ap.add_argument("--zoom-tau", type=float, default=0.12,
+                    help="zoom spring release time constant (s)")
+    ap.add_argument("--test", action="store_true", help="shortcut: 4s, 640x368")
     args = ap.parse_args()
 
     if args.test:
@@ -272,8 +376,11 @@ def main():
         prompts = (prompts * reps)[: args.num_keyframes]
 
     print(f"[audio] analyzing {args.audio} ...", flush=True)
-    an = analyze_audio(args.audio, args.fps, args.max_duration)
-    print(f"[audio] dur={an['dur']:.2f}s frames={an['n_frames']} tempo={an['tempo']:.1f} hits={len(an['hits'])}", flush=True)
+    an = analyze_audio(args.audio, args.fps, args.max_duration, tempo=args.tempo)
+    print(f"[audio] dur={an['dur']:.2f}s frames={an['n_frames']} "
+          f"tempo={an['tempo']:.1f} ({an['tempo_source']}) hits={len(an['hits'])}",
+          flush=True)
+    t0 = an["hits"][0][0] if an["hits"] else 0.0  # anchor beat grid on first kick
 
     rev = "procedural"
     if args.no_diffusion:
@@ -282,12 +389,25 @@ def main():
         keys, rev = diffusion_keyframes_chained(
             prompts, args.seed, args.steps, chain_strength=args.chain_strength,
             negative_prompt=args.negative_prompt)
+        if not args.no_grade:
+            keys = grade_keys(keys)
         keys = upscale_keys(keys, args.width, args.height)
+        # Persist keyframes for inspection / reuse.
+        keydir = os.path.join(os.path.dirname(args.output) or ".", "keys")
+        os.makedirs(keydir, exist_ok=True)
+        base = os.path.splitext(os.path.basename(args.output))[0]
+        for i, k in enumerate(keys):
+            cv2.imwrite(os.path.join(keydir, f"{base}_key{i:02d}.png"),
+                        cv2.cvtColor(k, cv2.COLOR_RGB2BGR))
 
     seg = plan_segments(an["n_frames"], an["is_hit"], an["hit_env"], len(keys),
-                        args.fps, key_every=args.key_every)
+                        args.fps, key_every=args.key_every, tempo=an["tempo"],
+                        beats_per_scene=args.beats_per_scene, t0=t0)
     print("[render] rendering frames ...", flush=True)
-    frames = render_frames(keys, an, seg, args.width, args.height, args.fps, args.seed)
+    frames = render_frames(keys, an, seg, args.width, args.height, args.fps,
+                           args.seed, tempo=an["tempo"],
+                           beats_per_scene=args.beats_per_scene,
+                           zoom_punch=args.zoom_punch, zoom_tau=args.zoom_tau)
     print(f"[mux] writing {args.output} ...", flush=True)
     write_video(frames, args.fps, args.audio, args.output, an["dur"])
 
@@ -300,6 +420,9 @@ def main():
         "size": [args.width, args.height],
         "hits": an["hits"],
         "tempo": an["tempo"],
+        "tempo_source": an["tempo_source"],
+        "beats_per_scene": args.beats_per_scene,
+        "key_every": args.key_every,
         "created_utc": datetime.now(timezone.utc).isoformat(),
     }
     with open(os.path.splitext(args.output)[0] + ".json", "w") as f:

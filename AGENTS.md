@@ -17,3 +17,4 @@
 ## Conditioning / pipeline
 - Conditioning flexible: 0/1/N prompts OK; `abstract thing` valid for tests; unconditioned/procedural frames allowed.
 - Shape: `audio onset/kick (librosa)` → `frames (Z-Image)` → `assemble (ffmpeg/moviepy)`; outputs in `output/` (gitignored). Log model rev, seed, hit timestamps.
+- Key CLI: `python generate.py --audio X.wav --output output/Y.mp4 [--tempo BPM] [--beats-per-scene 2] [--key-every auto] [--test] [--no-diffusion]`. Tempo optional (else estimated); scenes change on beat grid; kicks drive spring zoom punch (`--zoom-punch/--zoom-tau`). Keys are chained img2img for coherence; yellow skies sage-graded unless `--no-grade`.
