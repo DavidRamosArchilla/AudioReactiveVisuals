@@ -1,0 +1,7 @@
+diffusers==0.36.0
+transformers==4.57.3
+huggingface-hub==0.36.0
+safetensors==0.7.0
+peft>=0.17.0
+# Already in base conda env (/home/david/miniconda3): torch+CUDA, librosa,
+# moviepy, opencv-python, pillow, numpy, scipy, imageio-ffmpeg. System ffmpeg 4.4.2.
