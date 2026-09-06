@@ -1,7 +1,13 @@
-diffusers==0.36.0
-transformers==4.57.3
-huggingface-hub==0.36.0
-safetensors==0.7.0
-peft>=0.17.0
-# Already in base conda env (/home/david/miniconda3): torch+CUDA, librosa,
-# moviepy, opencv-python, pillow, numpy, scipy, imageio-ffmpeg. System ffmpeg 4.4.2.
+diffusers==0.40.0
+transformers==5.16.1
+safetensors==0.8.0
+accelerate==1.12.0
+librosa==1.0.0
+opencv-python==5.0.0.93
+imageio-ffmpeg==0.6.0
+pytest==9.0.3  # dev only: CPU-only suite in tests/ (no GPU needed)
+# Env: nibbler (/home/d.ramos/miniconda/envs/nibbler, torch 2.12+cu130).
+# NOTE on clusters: prepend conda lib to LD_LIBRARY_PATH so its libstdc++
+# shadows the ohpc one, else diffusers/scipy import fails with CXXABI errors:
+#   export LD_LIBRARY_PATH=/home/d.ramos/miniconda/envs/nibbler/lib:$LD_LIBRARY_PATH
+# System ffmpeg missing here -> generate.py falls back to imageio-ffmpeg binary.
